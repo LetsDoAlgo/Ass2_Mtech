@@ -100,16 +100,22 @@ if [[ ! -f "$NODE_SRC" ]]; then
   exit 1
 fi
 
+source_safe() {
+  # ROS setup scripts can reference unset variables internally.
+  # Temporarily disable nounset to avoid false failures.
+  set +u
+  # shellcheck disable=SC1090
+  source "$1"
+  set -u
+}
+
 # Source ROS 2 setup.
 if [[ -n "${ROS_DISTRO:-}" && -f "/opt/ros/${ROS_DISTRO}/setup.bash" ]]; then
-  # shellcheck disable=SC1090
-  source "/opt/ros/${ROS_DISTRO}/setup.bash"
+  source_safe "/opt/ros/${ROS_DISTRO}/setup.bash"
 elif [[ -f "/opt/ros/humble/setup.bash" ]]; then
-  # shellcheck disable=SC1091
-  source /opt/ros/humble/setup.bash
+  source_safe /opt/ros/humble/setup.bash
 elif [[ -f "/opt/ros/jazzy/setup.bash" ]]; then
-  # shellcheck disable=SC1091
-  source /opt/ros/jazzy/setup.bash
+  source_safe /opt/ros/jazzy/setup.bash
 else
   echo "ERROR: Could not find ROS 2 setup.bash in /opt/ros/<distro>/"
   echo "Please install/source ROS 2 first."
@@ -190,8 +196,7 @@ PY
 
   cd "$WORKSPACE"
   colcon build --packages-select "$PKG_NAME"
-  # shellcheck disable=SC1090
-  source "$WORKSPACE/install/setup.bash"
+  source_safe "$WORKSPACE/install/setup.bash"
 }
 
 run_node_package() {
