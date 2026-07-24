@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# One-file Linux launcher for ROS2 D* workflow.
+# This script can:
+# 1) run planner node,
+# 2) publish a goal,
+# 3) read plan output,
+# 4) run end-to-end demo.
+
+MODE="direct"
+ACTION="node"
+WORKSPACE="$HOME/vlab_ws"
+PKG_NAME="dstar_planner"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NODE_SRC="$SCRIPT_DIR/ros2_dstar_node.py"
+
+MAP_TOPIC="/map"
+ODOM_TOPIC="/odom"
+GOAL_TOPIC="/goal_pose"
+PLAN_TOPIC="/plan"
+OCC_THRESHOLD="50"
+MAX_ITER="50000"
+
+GOAL_X="7.0"
+GOAL_Y="4.0"
+GOAL_Z="0.0"
+GOAL_FRAME="map"
+
+WAIT_SECONDS="2"
+
+usage() {
+  cat <<EOF
+Usage: $0 [options]
+
+Options:
+  --mode direct|package       Run mode (default: direct)
+  --action node|goal|plan|demo
+                              node: run planner node only
+                              goal: publish one goal only
+                              plan: echo one /plan message only
+                              demo: run node + publish goal + read one /plan
+  --workspace PATH            ROS workspace for package mode (default: ~/vlab_ws)
+  --map-topic TOPIC           Map topic (default: /map)
+  --odom-topic TOPIC          Odom topic (default: /odom)
+  --goal-topic TOPIC          Goal topic (default: /goal_pose)
+  --plan-topic TOPIC          Output plan topic (default: /plan)
+  --occupied-threshold INT    Occupancy threshold (default: 50)
+  --max-iterations INT        D* max iterations (default: 50000)
+  --goal-x FLOAT              Goal x in map frame (default: 7.0)
+  --goal-y FLOAT              Goal y in map frame (default: 4.0)
+  --goal-z FLOAT              Goal z (default: 0.0)
+  --goal-frame STR            Goal frame_id (default: map)
+  --wait-seconds INT          Wait before sending goal in demo (default: 2)
+  -h, --help                  Show this help
+
+Examples:
+  $0 --action node
+  $0 --action goal --goal-x 6.0 --goal-y 3.5
+  $0 --action plan
+  $0 --action demo --mode package --workspace ~/vlab_ws
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mode) MODE="$2"; shift 2 ;;
+    --action) ACTION="$2"; shift 2 ;;
+    --workspace) WORKSPACE="$2"; shift 2 ;;
+    --map-topic) MAP_TOPIC="$2"; shift 2 ;;
+    --odom-topic) ODOM_TOPIC="$2"; shift 2 ;;
+    --goal-topic) GOAL_TOPIC="$2"; shift 2 ;;
+    --plan-topic) PLAN_TOPIC="$2"; shift 2 ;;
+    --occupied-threshold) OCC_THRESHOLD="$2"; shift 2 ;;
+    --max-iterations) MAX_ITER="$2"; shift 2 ;;
+    --goal-x) GOAL_X="$2"; shift 2 ;;
+    --goal-y) GOAL_Y="$2"; shift 2 ;;
+    --goal-z) GOAL_Z="$2"; shift 2 ;;
+    --goal-frame) GOAL_FRAME="$2"; shift 2 ;;
+    --wait-seconds) WAIT_SECONDS="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *)
+      echo "Unknown argument: $1"
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [[ ! -f "$NODE_SRC" ]]; then
+  echo "ERROR: ros2_dstar_node.py not found at: $NODE_SRC"
+  exit 1
+fi
+
+# Source ROS 2 setup.
+if [[ -n "${ROS_DISTRO:-}" && -f "/opt/ros/${ROS_DISTRO}/setup.bash" ]]; then
+  # shellcheck disable=SC1090
+  source "/opt/ros/${ROS_DISTRO}/setup.bash"
+elif [[ -f "/opt/ros/humble/setup.bash" ]]; then
+  # shellcheck disable=SC1091
+  source /opt/ros/humble/setup.bash
+elif [[ -f "/opt/ros/jazzy/setup.bash" ]]; then
+  # shellcheck disable=SC1091
+  source /opt/ros/jazzy/setup.bash
+else
+  echo "ERROR: Could not find ROS 2 setup.bash in /opt/ros/<distro>/"
+  echo "Please install/source ROS 2 first."
+  exit 1
+fi
+
+if ! command -v ros2 >/dev/null 2>&1; then
+  echo "ERROR: ros2 command not found after sourcing ROS environment."
+  exit 1
+fi
+
+run_node_direct() {
+  chmod +x "$NODE_SRC"
+  python3 "$NODE_SRC" --ros-args \
+    -p map_topic:="$MAP_TOPIC" \
+    -p odom_topic:="$ODOM_TOPIC" \
+    -p goal_topic:="$GOAL_TOPIC" \
+    -p plan_topic:="$PLAN_TOPIC" \
+    -p occupied_threshold:="$OCC_THRESHOLD" \
+    -p max_iterations:="$MAX_ITER"
+}
+
+prepare_package_and_env() {
+  if ! command -v colcon >/dev/null 2>&1; then
+    echo "ERROR: colcon not found. Install with: sudo apt install python3-colcon-common-extensions"
+    exit 1
+  fi
+
+  mkdir -p "$WORKSPACE/src"
+  cd "$WORKSPACE/src"
+
+  if [[ ! -d "$PKG_NAME" ]]; then
+    ros2 pkg create --build-type ament_python "$PKG_NAME" --dependencies rclpy nav_msgs geometry_msgs
+  fi
+
+  PKG_DIR="$WORKSPACE/src/$PKG_NAME"
+  PKG_PY_DIR="$PKG_DIR/$PKG_NAME"
+  mkdir -p "$PKG_PY_DIR"
+  cp "$NODE_SRC" "$PKG_PY_DIR/ros2_dstar_node.py"
+  chmod +x "$PKG_PY_DIR/ros2_dstar_node.py"
+
+  if [[ ! -f "$PKG_PY_DIR/__init__.py" ]]; then
+    touch "$PKG_PY_DIR/__init__.py"
+  fi
+
+  python3 - "$PKG_DIR/setup.py" <<'PY'
+import sys
+from pathlib import Path
+
+setup_path = Path(sys.argv[1])
+text = setup_path.read_text(encoding="utf-8")
+entry = "            'ros2_dstar_node = dstar_planner.ros2_dstar_node:main',\n"
+
+if "ros2_dstar_node = dstar_planner.ros2_dstar_node:main" in text:
+    raise SystemExit(0)
+
+needle = "'console_scripts': [\n"
+if needle in text:
+    text = text.replace(needle, needle + entry)
+else:
+    marker = "setup(\n"
+    if marker not in text:
+        raise SystemExit("ERROR: Could not parse setup.py to insert console_scripts entry")
+    insert = (
+        "    entry_points={\n"
+        "        'console_scripts': [\n"
+        "            'ros2_dstar_node = dstar_planner.ros2_dstar_node:main',\n"
+        "        ],\n"
+        "    },\n"
+    )
+    idx = text.rfind(")")
+    if idx == -1:
+        raise SystemExit("ERROR: Could not find closing ')' in setup.py")
+    text = text[:idx] + insert + text[idx:]
+
+setup_path.write_text(text, encoding="utf-8")
+PY
+
+  cd "$WORKSPACE"
+  colcon build --packages-select "$PKG_NAME"
+  # shellcheck disable=SC1090
+  source "$WORKSPACE/install/setup.bash"
+}
+
+run_node_package() {
+  ros2 run "$PKG_NAME" ros2_dstar_node --ros-args \
+    -p map_topic:="$MAP_TOPIC" \
+    -p odom_topic:="$ODOM_TOPIC" \
+    -p goal_topic:="$GOAL_TOPIC" \
+    -p plan_topic:="$PLAN_TOPIC" \
+    -p occupied_threshold:="$OCC_THRESHOLD" \
+    -p max_iterations:="$MAX_ITER"
+}
+
+publish_goal_once() {
+  ros2 topic pub -1 "$GOAL_TOPIC" geometry_msgs/PoseStamped "{header: {frame_id: '$GOAL_FRAME'}, pose: {position: {x: $GOAL_X, y: $GOAL_Y, z: $GOAL_Z}, orientation: {w: 1.0}}}"
+}
+
+echo_plan_once() {
+  ros2 topic echo --once "$PLAN_TOPIC"
+}
+
+if [[ "$MODE" != "direct" && "$MODE" != "package" ]]; then
+  echo "ERROR: Invalid mode '$MODE'. Use direct or package."
+  exit 1
+fi
+
+if [[ "$ACTION" != "node" && "$ACTION" != "goal" && "$ACTION" != "plan" && "$ACTION" != "demo" ]]; then
+  echo "ERROR: Invalid action '$ACTION'. Use node, goal, plan, or demo."
+  exit 1
+fi
+
+if [[ "$MODE" == "package" ]]; then
+  echo "[INFO] Preparing package mode workspace"
+  prepare_package_and_env
+fi
+
+run_node_cmd() {
+  if [[ "$MODE" == "direct" ]]; then
+    run_node_direct
+  else
+    run_node_package
+  fi
+}
+
+case "$ACTION" in
+  node)
+    echo "[INFO] Action=node: running planner"
+    run_node_cmd
+    ;;
+  goal)
+    echo "[INFO] Action=goal: publishing one goal on $GOAL_TOPIC"
+    publish_goal_once
+    ;;
+  plan)
+    echo "[INFO] Action=plan: reading one message from $PLAN_TOPIC"
+    echo_plan_once
+    ;;
+  demo)
+    echo "[INFO] Action=demo: run planner + publish goal + read one plan"
+    run_node_cmd &
+    NODE_PID=$!
+
+    cleanup() {
+      if kill -0 "$NODE_PID" >/dev/null 2>&1; then
+        kill "$NODE_PID" >/dev/null 2>&1 || true
+      fi
+    }
+    trap cleanup EXIT INT TERM
+
+    sleep "$WAIT_SECONDS"
+    publish_goal_once
+
+    # Wait briefly for planner output and print one plan message.
+    sleep 1
+    if ! echo_plan_once; then
+      echo "[WARN] Could not read plan message. Ensure /map and /odom are being published."
+    fi
+
+    echo "[INFO] Demo finished. Press Ctrl+C if node is still running."
+    wait "$NODE_PID"
+    ;;
+esac
