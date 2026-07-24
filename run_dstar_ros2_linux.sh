@@ -43,6 +43,7 @@ EXTRA_BRINGUP_CMD=""
 HEALTH_RETRIES="10"
 HEALTH_INTERVAL="2"
 HZ_SECONDS="5"
+GOAL_RETRIES="4"
 
 usage() {
   cat <<EOF
@@ -77,6 +78,7 @@ Options:
   --health-interval INT       Seconds between health retries (default: 2)
   --verify-log PATH           Verification report path (default: /tmp/dstar_e2e_verify.log)
   --hz-seconds INT            Duration for topic rate sampling (default: 5)
+  --goal-retries INT          Goal publish retries during verify (default: 4)
   -h, --help                  Show this help
 
 Examples:
@@ -115,6 +117,7 @@ while [[ $# -gt 0 ]]; do
     --health-interval) HEALTH_INTERVAL="$2"; shift 2 ;;
     --verify-log) VERIFY_LOG="$2"; shift 2 ;;
     --hz-seconds) HZ_SECONDS="$2"; shift 2 ;;
+    --goal-retries) GOAL_RETRIES="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *)
       echo "Unknown argument: $1"
@@ -430,9 +433,30 @@ sample_topic_rate() {
   return 0
 }
 
+wait_for_topic_count() {
+  local topic="$1"
+  local kind="$2"  # Publisher or Subscription
+  local retries="$3"
+  local interval="$4"
+  local i=1
+  local info_out
+
+  while [[ "$i" -le "$retries" ]]; do
+    info_out="$(ros2 topic info "$topic" 2>&1 || true)"
+    if echo "$info_out" | grep -Eq "${kind} count:\s*[1-9]"; then
+      return 0
+    fi
+    sleep "$interval"
+    i=$((i + 1))
+  done
+  return 1
+}
+
 run_verify_flow() {
   local verify_failed=0
   local plan_out
+  local plan_ok=0
+  local attempt=1
 
   : >"$VERIFY_LOG"
   echo "[INFO] Verification report: $VERIFY_LOG" | tee -a "$VERIFY_LOG"
@@ -486,19 +510,35 @@ run_verify_flow() {
   NODE_PID=$!
   sleep "$WAIT_SECONDS"
 
-  echo "[INFO] Publishing goal" | tee -a "$VERIFY_LOG"
-  if ! publish_goal_once 2>&1 | tee -a "$VERIFY_LOG"; then
-    verify_failed=1
+  # Ensure planner endpoints are visible before publishing one-shot goal.
+  if ! wait_for_topic_count "$PLAN_TOPIC" "Publisher" 10 1; then
+    echo "[WARN] Plan publisher did not appear in time on $PLAN_TOPIC" | tee -a "$VERIFY_LOG"
+  fi
+  if ! wait_for_topic_count "$GOAL_TOPIC" "Subscription" 10 1; then
+    echo "[WARN] Goal subscriber did not appear in time on $GOAL_TOPIC" | tee -a "$VERIFY_LOG"
   fi
 
-  echo "[INFO] Reading plan output once" | tee -a "$VERIFY_LOG"
-  plan_out="$(timeout 10s ros2 topic echo --once "$PLAN_TOPIC" 2>&1 || true)"
-  echo "$plan_out" | tee -a "$VERIFY_LOG"
+  while [[ "$attempt" -le "$GOAL_RETRIES" ]]; do
+    echo "[INFO] Goal/plan attempt $attempt/$GOAL_RETRIES" | tee -a "$VERIFY_LOG"
+    if ! publish_goal_once 2>&1 | tee -a "$VERIFY_LOG"; then
+      verify_failed=1
+    fi
 
-  if echo "$plan_out" | grep -Eq "poses:|frame_id|nav_msgs/msg/Path"; then
-    echo "[PASS] Plan output detected" | tee -a "$VERIFY_LOG"
-  else
-    echo "[FAIL] Plan output not detected" | tee -a "$VERIFY_LOG"
+    plan_out="$(timeout 12s ros2 topic echo --once "$PLAN_TOPIC" 2>&1 || true)"
+    echo "$plan_out" | tee -a "$VERIFY_LOG"
+
+    if echo "$plan_out" | grep -Eq "poses:|frame_id|nav_msgs/msg/Path"; then
+      echo "[PASS] Plan output detected" | tee -a "$VERIFY_LOG"
+      plan_ok=1
+      break
+    fi
+
+    attempt=$((attempt + 1))
+    sleep 1
+  done
+
+  if [[ "$plan_ok" -ne 1 ]]; then
+    echo "[FAIL] Plan output not detected after retries" | tee -a "$VERIFY_LOG"
     verify_failed=1
   fi
 
