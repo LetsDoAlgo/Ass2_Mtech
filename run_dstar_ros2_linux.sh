@@ -22,6 +22,7 @@ PKG_NAME="dstar_planner"
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 NODE_SRC="$SCRIPT_DIR/ros2_dstar_node.py"
+VERIFY_LOG="/tmp/dstar_e2e_verify.log"
 
 MAP_TOPIC="/map"
 ODOM_TOPIC="/odom"
@@ -37,6 +38,10 @@ GOAL_Z="0.0"
 GOAL_FRAME="map"
 
 WAIT_SECONDS="2"
+BRINGUP_CMD=""
+HEALTH_RETRIES="10"
+HEALTH_INTERVAL="2"
+HZ_SECONDS="5"
 
 usage() {
   cat <<EOF
@@ -44,13 +49,14 @@ Usage: $0 [options]
 
 Options:
   --mode direct|package       Run mode (default: direct)
-  --action node|goal|plan|demo|health|oneclick
+  --action node|goal|plan|demo|health|oneclick|verify
                               node: run planner node only
                               goal: publish one goal only
                               plan: echo one /plan message only
                               demo: run node + publish goal + read one /plan
                               health: check if map/odom/scan are publishing
                               oneclick: health + UI + planner + goal + plan
+                              verify: full end-to-end verification with report
   --workspace PATH            ROS workspace for package mode (default: ~/vlab_ws)
   --map-topic TOPIC           Map topic (default: /map)
   --odom-topic TOPIC          Odom topic (default: /odom)
@@ -64,6 +70,11 @@ Options:
   --goal-z FLOAT              Goal z (default: 0.0)
   --goal-frame STR            Goal frame_id (default: map)
   --wait-seconds INT          Wait before sending goal in demo (default: 2)
+  --bringup-cmd "CMD"        Optional sim/SLAM launch command for oneclick
+  --health-retries INT        Health check retries in oneclick (default: 10)
+  --health-interval INT       Seconds between health retries (default: 2)
+  --verify-log PATH           Verification report path (default: /tmp/dstar_e2e_verify.log)
+  --hz-seconds INT            Duration for topic rate sampling (default: 5)
   -h, --help                  Show this help
 
 Examples:
@@ -73,6 +84,8 @@ Examples:
   $0 --action health
   $0 --action demo --mode package --workspace ~/vlab_ws
   $0 --action oneclick --mode package --goal-x 2.0 --goal-y 1.0
+  $0 --action oneclick --mode package --bringup-cmd "ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py"
+  $0 --action verify --mode package --goal-x 2.0 --goal-y 1.0
 EOF
 }
 
@@ -93,6 +106,11 @@ while [[ $# -gt 0 ]]; do
     --goal-z) GOAL_Z="$2"; shift 2 ;;
     --goal-frame) GOAL_FRAME="$2"; shift 2 ;;
     --wait-seconds) WAIT_SECONDS="$2"; shift 2 ;;
+    --bringup-cmd) BRINGUP_CMD="$2"; shift 2 ;;
+    --health-retries) HEALTH_RETRIES="$2"; shift 2 ;;
+    --health-interval) HEALTH_INTERVAL="$2"; shift 2 ;;
+    --verify-log) VERIFY_LOG="$2"; shift 2 ;;
+    --hz-seconds) HZ_SECONDS="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *)
       echo "Unknown argument: $1"
@@ -312,13 +330,139 @@ launch_ui_dashboards() {
   fi
 }
 
+run_optional_bringup() {
+  if [[ -z "$BRINGUP_CMD" ]]; then
+    return 0
+  fi
+
+  echo "[INFO] Starting bringup command in background"
+  echo "[INFO] Command: $BRINGUP_CMD"
+  bash -lc "$BRINGUP_CMD" >/tmp/dstar_bringup.log 2>&1 &
+  BRINGUP_PID=$!
+  echo "[INFO] Bringup PID: $BRINGUP_PID"
+}
+
+wait_for_health_ready() {
+  local attempt=1
+  while [[ "$attempt" -le "$HEALTH_RETRIES" ]]; do
+    echo "[INFO] Health attempt $attempt/$HEALTH_RETRIES"
+    if run_health_checks; then
+      return 0
+    fi
+    if [[ "$attempt" -lt "$HEALTH_RETRIES" ]]; then
+      sleep "$HEALTH_INTERVAL"
+    fi
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+sample_topic_rate() {
+  local topic="$1"
+  local label="$2"
+  local required="${3:-required}"
+  local hz_out
+
+  echo "[INFO] Sampling rate for $label topic: $topic" | tee -a "$VERIFY_LOG"
+  hz_out="$(timeout "${HZ_SECONDS}s" ros2 topic hz "$topic" 2>&1 || true)"
+  echo "$hz_out" | tee -a "$VERIFY_LOG"
+
+  if echo "$hz_out" | grep -qi "average rate"; then
+    echo "[PASS] $label rate detected" | tee -a "$VERIFY_LOG"
+    return 0
+  fi
+
+  if [[ "$required" == "required" ]]; then
+    echo "[FAIL] $label rate not detected" | tee -a "$VERIFY_LOG"
+    return 1
+  fi
+
+  echo "[WARN] $label rate not detected (optional topic)" | tee -a "$VERIFY_LOG"
+  return 0
+}
+
+run_verify_flow() {
+  local verify_failed=0
+  local plan_out
+
+  : >"$VERIFY_LOG"
+  echo "[INFO] Verification report: $VERIFY_LOG" | tee -a "$VERIFY_LOG"
+  echo "[INFO] Starting full end-to-end verification" | tee -a "$VERIFY_LOG"
+
+  launch_ui_dashboards
+  run_optional_bringup
+
+  cleanup() {
+    if [[ -n "${NODE_PID:-}" ]] && kill -0 "$NODE_PID" >/dev/null 2>&1; then
+      kill "$NODE_PID" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${BRINGUP_PID:-}" ]] && kill -0 "$BRINGUP_PID" >/dev/null 2>&1; then
+      kill "$BRINGUP_PID" >/dev/null 2>&1 || true
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! wait_for_health_ready; then
+    echo "[FAIL] Health checks did not pass within retry window" | tee -a "$VERIFY_LOG"
+    if [[ -n "${BRINGUP_PID:-}" ]]; then
+      echo "[INFO] Bringup logs: /tmp/dstar_bringup.log" | tee -a "$VERIFY_LOG"
+    fi
+    return 1
+  fi
+
+  echo "[INFO] Topic list snapshot" | tee -a "$VERIFY_LOG"
+  ros2 topic list 2>&1 | sort | tee -a "$VERIFY_LOG"
+
+  echo "[INFO] Topic info snapshot" | tee -a "$VERIFY_LOG"
+  for t in "$MAP_TOPIC" "$ODOM_TOPIC" "$SCAN_TOPIC" "$GOAL_TOPIC" "$PLAN_TOPIC"; do
+    echo "[INFO] ros2 topic info $t" | tee -a "$VERIFY_LOG"
+    ros2 topic info "$t" 2>&1 | tee -a "$VERIFY_LOG" || true
+  done
+
+  if ! sample_topic_rate "$MAP_TOPIC" "map" "required"; then
+    verify_failed=1
+  fi
+  if ! sample_topic_rate "$ODOM_TOPIC" "odom" "required"; then
+    verify_failed=1
+  fi
+  sample_topic_rate "$SCAN_TOPIC" "scan" "optional" || true
+
+  run_node_cmd &
+  NODE_PID=$!
+  sleep "$WAIT_SECONDS"
+
+  echo "[INFO] Publishing goal" | tee -a "$VERIFY_LOG"
+  if ! publish_goal_once 2>&1 | tee -a "$VERIFY_LOG"; then
+    verify_failed=1
+  fi
+
+  echo "[INFO] Reading plan output once" | tee -a "$VERIFY_LOG"
+  plan_out="$(timeout 10s ros2 topic echo --once "$PLAN_TOPIC" 2>&1 || true)"
+  echo "$plan_out" | tee -a "$VERIFY_LOG"
+
+  if echo "$plan_out" | grep -Eq "poses:|frame_id|nav_msgs/msg/Path"; then
+    echo "[PASS] Plan output detected" | tee -a "$VERIFY_LOG"
+  else
+    echo "[FAIL] Plan output not detected" | tee -a "$VERIFY_LOG"
+    verify_failed=1
+  fi
+
+  if [[ "$verify_failed" -eq 0 ]]; then
+    echo "[PASS] End-to-end verification PASSED" | tee -a "$VERIFY_LOG"
+    return 0
+  fi
+
+  echo "[FAIL] End-to-end verification FAILED" | tee -a "$VERIFY_LOG"
+  return 1
+}
+
 if [[ "$MODE" != "direct" && "$MODE" != "package" ]]; then
   echo "ERROR: Invalid mode '$MODE'. Use direct or package."
   exit 1
 fi
 
-if [[ "$ACTION" != "node" && "$ACTION" != "goal" && "$ACTION" != "plan" && "$ACTION" != "demo" && "$ACTION" != "health" && "$ACTION" != "oneclick" ]]; then
-  echo "ERROR: Invalid action '$ACTION'. Use node, goal, plan, demo, health, or oneclick."
+if [[ "$ACTION" != "node" && "$ACTION" != "goal" && "$ACTION" != "plan" && "$ACTION" != "demo" && "$ACTION" != "health" && "$ACTION" != "oneclick" && "$ACTION" != "verify" ]]; then
+  echo "ERROR: Invalid action '$ACTION'. Use node, goal, plan, demo, health, oneclick, or verify."
   exit 1
 fi
 
@@ -380,22 +524,32 @@ case "$ACTION" in
   oneclick)
     echo "[INFO] Action=oneclick: running full automated flow"
 
-    if ! run_health_checks; then
-      echo "[ERROR] Health checks failed. Fix map/odom publishers and retry oneclick."
-      exit 1
-    fi
-
     launch_ui_dashboards
 
-    run_node_cmd &
-    NODE_PID=$!
+    run_optional_bringup
 
     cleanup() {
-      if kill -0 "$NODE_PID" >/dev/null 2>&1; then
+      if [[ -n "${NODE_PID:-}" ]] && kill -0 "$NODE_PID" >/dev/null 2>&1; then
         kill "$NODE_PID" >/dev/null 2>&1 || true
+      fi
+      if [[ -n "${BRINGUP_PID:-}" ]] && kill -0 "$BRINGUP_PID" >/dev/null 2>&1; then
+        kill "$BRINGUP_PID" >/dev/null 2>&1 || true
       fi
     }
     trap cleanup EXIT INT TERM
+
+    if ! wait_for_health_ready; then
+      echo "[ERROR] Health checks failed after retries."
+      echo "[INFO] If sim is not auto-started, rerun with --bringup-cmd."
+      echo "[INFO] Example: --bringup-cmd \"ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py\""
+      if [[ -n "${BRINGUP_PID:-}" ]]; then
+        echo "[INFO] Bringup logs: /tmp/dstar_bringup.log"
+      fi
+      exit 1
+    fi
+
+    run_node_cmd &
+    NODE_PID=$!
 
     sleep "$WAIT_SECONDS"
     publish_goal_once
@@ -408,5 +562,9 @@ case "$ACTION" in
 
     echo "[INFO] One-click flow complete. Planner stays running for further goals. Press Ctrl+C to stop."
     wait "$NODE_PID"
+    ;;
+  verify)
+    echo "[INFO] Action=verify: full end-to-end verification"
+    run_verify_flow
     ;;
 esac
