@@ -25,6 +25,7 @@ NODE_SRC="$SCRIPT_DIR/ros2_dstar_node.py"
 
 MAP_TOPIC="/map"
 ODOM_TOPIC="/odom"
+SCAN_TOPIC="/scan"
 GOAL_TOPIC="/goal_pose"
 PLAN_TOPIC="/plan"
 OCC_THRESHOLD="50"
@@ -43,14 +44,17 @@ Usage: $0 [options]
 
 Options:
   --mode direct|package       Run mode (default: direct)
-  --action node|goal|plan|demo
+  --action node|goal|plan|demo|health|oneclick
                               node: run planner node only
                               goal: publish one goal only
                               plan: echo one /plan message only
                               demo: run node + publish goal + read one /plan
+                              health: check if map/odom/scan are publishing
+                              oneclick: health + UI + planner + goal + plan
   --workspace PATH            ROS workspace for package mode (default: ~/vlab_ws)
   --map-topic TOPIC           Map topic (default: /map)
   --odom-topic TOPIC          Odom topic (default: /odom)
+  --scan-topic TOPIC          Scan topic (default: /scan)
   --goal-topic TOPIC          Goal topic (default: /goal_pose)
   --plan-topic TOPIC          Output plan topic (default: /plan)
   --occupied-threshold INT    Occupancy threshold (default: 50)
@@ -66,7 +70,9 @@ Examples:
   $0 --action node
   $0 --action goal --goal-x 6.0 --goal-y 3.5
   $0 --action plan
+  $0 --action health
   $0 --action demo --mode package --workspace ~/vlab_ws
+  $0 --action oneclick --mode package --goal-x 2.0 --goal-y 1.0
 EOF
 }
 
@@ -77,6 +83,7 @@ while [[ $# -gt 0 ]]; do
     --workspace) WORKSPACE="$2"; shift 2 ;;
     --map-topic) MAP_TOPIC="$2"; shift 2 ;;
     --odom-topic) ODOM_TOPIC="$2"; shift 2 ;;
+    --scan-topic) SCAN_TOPIC="$2"; shift 2 ;;
     --goal-topic) GOAL_TOPIC="$2"; shift 2 ;;
     --plan-topic) PLAN_TOPIC="$2"; shift 2 ;;
     --occupied-threshold) OCC_THRESHOLD="$2"; shift 2 ;;
@@ -217,13 +224,101 @@ echo_plan_once() {
   ros2 topic echo --once "$PLAN_TOPIC"
 }
 
+check_topic_health() {
+  local topic="$1"
+  local label="$2"
+  local qos_mode="${3:-default}"
+  local info_out
+  local msg_out
+
+  echo "[INFO] Checking $label topic: $topic"
+
+  if ! info_out="$(ros2 topic info "$topic" 2>&1)"; then
+    echo "[FAIL] $label: topic does not exist"
+    return 1
+  fi
+
+  echo "$info_out"
+  if ! echo "$info_out" | grep -Eq "Publisher count:\s*[1-9]"; then
+    echo "[FAIL] $label: no active publishers"
+    return 1
+  fi
+
+  if [[ "$qos_mode" == "sensor_data" ]]; then
+    if msg_out="$(timeout 6s ros2 topic echo --once "$topic" --qos-profile sensor_data 2>&1)"; then
+      echo "[PASS] $label: received at least one message"
+      return 0
+    fi
+  else
+    if msg_out="$(timeout 6s ros2 topic echo --once "$topic" 2>&1)"; then
+      echo "[PASS] $label: received at least one message"
+      return 0
+    fi
+  fi
+
+  echo "[FAIL] $label: publisher exists but no message received within timeout"
+  echo "$msg_out"
+  return 1
+}
+
+run_health_checks() {
+  local failed=0
+
+  echo "[INFO] Running topic publishing health checks"
+  echo "[INFO] Tip: make sure Gazebo is playing (not paused)"
+
+  if ! check_topic_health "$MAP_TOPIC" "map"; then
+    failed=1
+  fi
+
+  if ! check_topic_health "$ODOM_TOPIC" "odom"; then
+    failed=1
+  fi
+
+  if ! check_topic_health "$SCAN_TOPIC" "scan" "sensor_data"; then
+    echo "[WARN] Scan check failed. If your stack does not publish scan, this can be ignored for planner-only runs."
+  fi
+
+  if [[ "$failed" -eq 0 ]]; then
+    echo "[PASS] Core planner inputs look healthy: map and odom are publishing."
+  else
+    echo "[FAIL] Core planner inputs are not ready. Fix map/odom publishers before running planner demo."
+    return 1
+  fi
+}
+
+launch_ui_dashboards() {
+  echo "[INFO] Launching recommended UI dashboards (if installed)"
+
+  if command -v rviz2 >/dev/null 2>&1; then
+    rviz2 >/dev/null 2>&1 &
+    echo "[INFO] Started rviz2"
+  else
+    echo "[WARN] rviz2 not found; skipping RViz"
+  fi
+
+  if command -v rqt_graph >/dev/null 2>&1; then
+    rqt_graph >/dev/null 2>&1 &
+    echo "[INFO] Started rqt_graph"
+  else
+    echo "[WARN] rqt_graph not found; skipping graph UI"
+  fi
+
+  if command -v rqt_topic >/dev/null 2>&1; then
+    rqt_topic >/dev/null 2>&1 &
+    echo "[INFO] Started rqt_topic"
+  else
+    echo "[WARN] rqt_topic not found; skipping topic UI"
+  fi
+}
+
 if [[ "$MODE" != "direct" && "$MODE" != "package" ]]; then
   echo "ERROR: Invalid mode '$MODE'. Use direct or package."
   exit 1
 fi
 
-if [[ "$ACTION" != "node" && "$ACTION" != "goal" && "$ACTION" != "plan" && "$ACTION" != "demo" ]]; then
-  echo "ERROR: Invalid action '$ACTION'. Use node, goal, plan, or demo."
+if [[ "$ACTION" != "node" && "$ACTION" != "goal" && "$ACTION" != "plan" && "$ACTION" != "demo" && "$ACTION" != "health" && "$ACTION" != "oneclick" ]]; then
+  echo "ERROR: Invalid action '$ACTION'. Use node, goal, plan, demo, health, or oneclick."
   exit 1
 fi
 
@@ -253,6 +348,10 @@ case "$ACTION" in
     echo "[INFO] Action=plan: reading one message from $PLAN_TOPIC"
     echo_plan_once
     ;;
+  health)
+    echo "[INFO] Action=health: checking map/odom/scan publishing"
+    run_health_checks
+    ;;
   demo)
     echo "[INFO] Action=demo: run planner + publish goal + read one plan"
     run_node_cmd &
@@ -272,9 +371,42 @@ case "$ACTION" in
     sleep 1
     if ! echo_plan_once; then
       echo "[WARN] Could not read plan message. Ensure /map and /odom are being published."
+      echo "[INFO] Run: bash run_dstar_ros2_linux.sh --action health --mode $MODE"
     fi
 
     echo "[INFO] Demo finished. Press Ctrl+C if node is still running."
+    wait "$NODE_PID"
+    ;;
+  oneclick)
+    echo "[INFO] Action=oneclick: running full automated flow"
+
+    if ! run_health_checks; then
+      echo "[ERROR] Health checks failed. Fix map/odom publishers and retry oneclick."
+      exit 1
+    fi
+
+    launch_ui_dashboards
+
+    run_node_cmd &
+    NODE_PID=$!
+
+    cleanup() {
+      if kill -0 "$NODE_PID" >/dev/null 2>&1; then
+        kill "$NODE_PID" >/dev/null 2>&1 || true
+      fi
+    }
+    trap cleanup EXIT INT TERM
+
+    sleep "$WAIT_SECONDS"
+    publish_goal_once
+
+    sleep 1
+    if ! echo_plan_once; then
+      echo "[WARN] Could not read plan message. Check RViz/rqt_topic and rerun health."
+      echo "[INFO] Run: bash run_dstar_ros2_linux.sh --action health --mode $MODE"
+    fi
+
+    echo "[INFO] One-click flow complete. Planner stays running for further goals. Press Ctrl+C to stop."
     wait "$NODE_PID"
     ;;
 esac
