@@ -39,6 +39,7 @@ GOAL_FRAME="map"
 
 WAIT_SECONDS="2"
 BRINGUP_CMD=""
+EXTRA_BRINGUP_CMD=""
 HEALTH_RETRIES="10"
 HEALTH_INTERVAL="2"
 HZ_SECONDS="5"
@@ -71,6 +72,7 @@ Options:
   --goal-frame STR            Goal frame_id (default: map)
   --wait-seconds INT          Wait before sending goal in demo (default: 2)
   --bringup-cmd "CMD"        Optional sim/SLAM launch command for oneclick
+  --extra-bringup-cmd "CMD"  Optional second launch command (e.g., SLAM)
   --health-retries INT        Health check retries in oneclick (default: 10)
   --health-interval INT       Seconds between health retries (default: 2)
   --verify-log PATH           Verification report path (default: /tmp/dstar_e2e_verify.log)
@@ -85,6 +87,7 @@ Examples:
   $0 --action demo --mode package --workspace ~/vlab_ws
   $0 --action oneclick --mode package --goal-x 2.0 --goal-y 1.0
   $0 --action oneclick --mode package --bringup-cmd "ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py"
+  $0 --action verify --mode package --bringup-cmd "ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py" --extra-bringup-cmd "ros2 launch turtlebot3_cartographer cartographer.launch.py use_sim_time:=True"
   $0 --action verify --mode package --goal-x 2.0 --goal-y 1.0
 EOF
 }
@@ -107,6 +110,7 @@ while [[ $# -gt 0 ]]; do
     --goal-frame) GOAL_FRAME="$2"; shift 2 ;;
     --wait-seconds) WAIT_SECONDS="$2"; shift 2 ;;
     --bringup-cmd) BRINGUP_CMD="$2"; shift 2 ;;
+    --extra-bringup-cmd) EXTRA_BRINGUP_CMD="$2"; shift 2 ;;
     --health-retries) HEALTH_RETRIES="$2"; shift 2 ;;
     --health-interval) HEALTH_INTERVAL="$2"; shift 2 ;;
     --verify-log) VERIFY_LOG="$2"; shift 2 ;;
@@ -331,20 +335,65 @@ launch_ui_dashboards() {
 }
 
 run_optional_bringup() {
-  if [[ -z "$BRINGUP_CMD" ]]; then
+  if [[ -z "$BRINGUP_CMD" && -z "$EXTRA_BRINGUP_CMD" ]]; then
     return 0
   fi
 
-  echo "[INFO] Starting bringup command in background"
-  echo "[INFO] Command: $BRINGUP_CMD"
-  bash -lc "$BRINGUP_CMD" >/tmp/dstar_bringup.log 2>&1 &
-  BRINGUP_PID=$!
-  echo "[INFO] Bringup PID: $BRINGUP_PID"
+  if [[ ("$BRINGUP_CMD" == *"turtlebot3"* || "$EXTRA_BRINGUP_CMD" == *"turtlebot3"*) && -z "${TURTLEBOT3_MODEL:-}" ]]; then
+    export TURTLEBOT3_MODEL=burger
+    echo "[WARN] TURTLEBOT3_MODEL not set. Defaulting to burger."
+  fi
+
+  if [[ -n "$BRINGUP_CMD" ]]; then
+    echo "[INFO] Starting bringup command in background"
+    echo "[INFO] Command: $BRINGUP_CMD"
+    bash -lc "$BRINGUP_CMD" >/tmp/dstar_bringup.log 2>&1 &
+    BRINGUP_PID=$!
+    echo "[INFO] Bringup PID: $BRINGUP_PID"
+  fi
+
+  if [[ -n "$EXTRA_BRINGUP_CMD" ]]; then
+    echo "[INFO] Starting extra bringup command in background"
+    echo "[INFO] Command: $EXTRA_BRINGUP_CMD"
+    bash -lc "$EXTRA_BRINGUP_CMD" >/tmp/dstar_extra_bringup.log 2>&1 &
+    EXTRA_BRINGUP_PID=$!
+    echo "[INFO] Extra bringup PID: $EXTRA_BRINGUP_PID"
+  fi
+}
+
+bringup_process_alive_or_report() {
+  local pid="$1"
+  local label="$2"
+  local log_path="$3"
+
+  if [[ -z "$pid" ]]; then
+    return 0
+  fi
+
+  if kill -0 "$pid" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "[ERROR] $label process exited early"
+  echo "[INFO] Last log lines from $log_path"
+  if [[ -f "$log_path" ]]; then
+    tail -n 40 "$log_path"
+  else
+    echo "[WARN] Log file missing: $log_path"
+  fi
+  return 1
 }
 
 wait_for_health_ready() {
   local attempt=1
   while [[ "$attempt" -le "$HEALTH_RETRIES" ]]; do
+    if ! bringup_process_alive_or_report "${BRINGUP_PID:-}" "Bringup" "/tmp/dstar_bringup.log"; then
+      return 1
+    fi
+    if ! bringup_process_alive_or_report "${EXTRA_BRINGUP_PID:-}" "Extra bringup" "/tmp/dstar_extra_bringup.log"; then
+      return 1
+    fi
+
     echo "[INFO] Health attempt $attempt/$HEALTH_RETRIES"
     if run_health_checks; then
       return 0
@@ -399,6 +448,9 @@ run_verify_flow() {
     if [[ -n "${BRINGUP_PID:-}" ]] && kill -0 "$BRINGUP_PID" >/dev/null 2>&1; then
       kill "$BRINGUP_PID" >/dev/null 2>&1 || true
     fi
+    if [[ -n "${EXTRA_BRINGUP_PID:-}" ]] && kill -0 "$EXTRA_BRINGUP_PID" >/dev/null 2>&1; then
+      kill "$EXTRA_BRINGUP_PID" >/dev/null 2>&1 || true
+    fi
   }
   trap cleanup EXIT INT TERM
 
@@ -406,6 +458,9 @@ run_verify_flow() {
     echo "[FAIL] Health checks did not pass within retry window" | tee -a "$VERIFY_LOG"
     if [[ -n "${BRINGUP_PID:-}" ]]; then
       echo "[INFO] Bringup logs: /tmp/dstar_bringup.log" | tee -a "$VERIFY_LOG"
+    fi
+    if [[ -n "${EXTRA_BRINGUP_PID:-}" ]]; then
+      echo "[INFO] Extra bringup logs: /tmp/dstar_extra_bringup.log" | tee -a "$VERIFY_LOG"
     fi
     return 1
   fi
@@ -535,6 +590,9 @@ case "$ACTION" in
       if [[ -n "${BRINGUP_PID:-}" ]] && kill -0 "$BRINGUP_PID" >/dev/null 2>&1; then
         kill "$BRINGUP_PID" >/dev/null 2>&1 || true
       fi
+      if [[ -n "${EXTRA_BRINGUP_PID:-}" ]] && kill -0 "$EXTRA_BRINGUP_PID" >/dev/null 2>&1; then
+        kill "$EXTRA_BRINGUP_PID" >/dev/null 2>&1 || true
+      fi
     }
     trap cleanup EXIT INT TERM
 
@@ -544,6 +602,9 @@ case "$ACTION" in
       echo "[INFO] Example: --bringup-cmd \"ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py\""
       if [[ -n "${BRINGUP_PID:-}" ]]; then
         echo "[INFO] Bringup logs: /tmp/dstar_bringup.log"
+      fi
+      if [[ -n "${EXTRA_BRINGUP_PID:-}" ]]; then
+        echo "[INFO] Extra bringup logs: /tmp/dstar_extra_bringup.log"
       fi
       exit 1
     fi
