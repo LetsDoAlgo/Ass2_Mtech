@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Guard against running via "sh script.sh" (dash), which lacks Bash features used here.
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "ERROR: Please run this script with bash, not sh."
+  echo "Use: bash run_dstar_ros2_linux.sh --action demo --mode package"
+  exit 1
+fi
+
 # One-file Linux launcher for ROS2 D* workflow.
 # This script can:
 # 1) run planner node,
@@ -12,7 +19,8 @@ MODE="direct"
 ACTION="node"
 WORKSPACE="$HOME/vlab_ws"
 PKG_NAME="dstar_planner"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 NODE_SRC="$SCRIPT_DIR/ros2_dstar_node.py"
 
 MAP_TOPIC="/map"
