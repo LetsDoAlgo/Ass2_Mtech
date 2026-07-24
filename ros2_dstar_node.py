@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import heapq
 import math
+from collections import deque
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -192,6 +193,46 @@ if ROS_AVAILABLE:
             r, c = rc
             return self.grid[r, c] == 0
 
+        def nearest_free(self, rc: Tuple[int, int], max_radius: int = 25) -> Tuple[int, int] | None:
+            """Return nearest free cell to rc using BFS over 4-connected neighbors."""
+            if self.grid is None or not self.in_bounds(rc):
+                return None
+            if self.is_free(rc):
+                return rc
+
+            q = deque([(rc, 0)])
+            visited = {rc}
+            while q:
+                (r, c), d = q.popleft()
+                if d > max_radius:
+                    continue
+                if self.is_free((r, c)):
+                    return (r, c)
+                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nr, nc = r + dr, c + dc
+                    nxt = (nr, nc)
+                    if nxt in visited:
+                        continue
+                    if not self.in_bounds(nxt):
+                        continue
+                    visited.add(nxt)
+                    q.append((nxt, d + 1))
+            return None
+
+        def nearby_free_candidates(self, center: Tuple[int, int], max_radius: int = 30) -> List[Tuple[int, int]]:
+            """Collect free cells around center ordered by Manhattan distance."""
+            if self.grid is None or not self.in_bounds(center):
+                return []
+
+            cr, cc = center
+            candidates: List[Tuple[int, int]] = []
+            for r in range(max(0, cr - max_radius), min(self.height, cr + max_radius + 1)):
+                for c in range(max(0, cc - max_radius), min(self.width, cc + max_radius + 1)):
+                    if self.grid[r, c] == 0:
+                        candidates.append((r, c))
+            candidates.sort(key=lambda rc: abs(rc[0] - cr) + abs(rc[1] - cc))
+            return candidates
+
         # ---- callbacks ----
         def on_map(self, msg: OccupancyGrid) -> None:
             # ROS wrapper step: convert OccupancyGrid into the binary map used by notebook D*.
@@ -232,21 +273,49 @@ if ROS_AVAILABLE:
                 self.get_logger().warn(f"Goal cell out of bounds: {self.goal_rc}")
                 return
 
-            if not self.is_free(self.start_rc):
-                self.get_logger().warn(f"Start cell is occupied: {self.start_rc}")
-                return
+            start_plan = self.start_rc
+            goal_plan = self.goal_rc
 
-            if not self.is_free(self.goal_rc):
-                self.get_logger().warn(f"Goal cell is occupied: {self.goal_rc}")
-                return
+            if not self.is_free(start_plan):
+                start_alt = self.nearest_free(start_plan)
+                if start_alt is None:
+                    self.get_logger().warn(f"Start cell is occupied and no nearby free cell found: {start_plan}")
+                    return
+                self.get_logger().warn(f"Start cell occupied {start_plan}; using nearby free cell {start_alt}")
+                start_plan = start_alt
 
-            planner = DStarLite(self.grid, self.start_rc, self.goal_rc)
+            if not self.is_free(goal_plan):
+                goal_alt = self.nearest_free(goal_plan)
+                if goal_alt is None:
+                    self.get_logger().warn(f"Goal cell is occupied and no nearby free cell found: {goal_plan}")
+                    return
+                self.get_logger().warn(f"Goal cell occupied {goal_plan}; using nearby free cell {goal_alt}")
+                goal_plan = goal_alt
+
+            planner = DStarLite(self.grid, start_plan, goal_plan)
             planner.compute_shortest_path(max_iter=self.max_iterations)
             path_cells = planner.extract_path()
 
-            if len(path_cells) < 2 and self.start_rc != self.goal_rc:
-                self.get_logger().warn("No valid path found for current map/start/goal.")
-                return
+            if len(path_cells) < 2 and start_plan != goal_plan:
+                # Try nearby alternative goals to handle partially explored maps.
+                found = False
+                for alt_goal in self.nearby_free_candidates(self.goal_rc):
+                    if alt_goal == goal_plan:
+                        continue
+                    planner = DStarLite(self.grid, start_plan, alt_goal)
+                    planner.compute_shortest_path(max_iter=self.max_iterations)
+                    candidate_path = planner.extract_path()
+                    if len(candidate_path) >= 2 or start_plan == alt_goal:
+                        path_cells = candidate_path
+                        goal_plan = alt_goal
+                        found = True
+                        self.get_logger().warn(
+                            f"No direct path to requested goal {self.goal_rc}; using reachable nearby goal {goal_plan}"
+                        )
+                        break
+                if not found:
+                    self.get_logger().warn("No valid path found for current map/start/goal.")
+                    return
 
             path_msg = Path()
             path_msg.header.stamp = self.get_clock().now().to_msg()
