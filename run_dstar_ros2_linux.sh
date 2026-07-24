@@ -457,6 +457,7 @@ run_verify_flow() {
   local plan_out
   local plan_ok=0
   local attempt=1
+  local plan_tmp
 
   : >"$VERIFY_LOG"
   echo "[INFO] Verification report: $VERIFY_LOG" | tee -a "$VERIFY_LOG"
@@ -520,11 +521,34 @@ run_verify_flow() {
 
   while [[ "$attempt" -le "$GOAL_RETRIES" ]]; do
     echo "[INFO] Goal/plan attempt $attempt/$GOAL_RETRIES" | tee -a "$VERIFY_LOG"
+
+    # Re-check endpoints each attempt in case node restarted or crashed.
+    if ! wait_for_topic_count "$PLAN_TOPIC" "Publisher" 5 1; then
+      echo "[WARN] No active publisher on $PLAN_TOPIC before attempt $attempt" | tee -a "$VERIFY_LOG"
+      attempt=$((attempt + 1))
+      sleep 1
+      continue
+    fi
+    if ! wait_for_topic_count "$GOAL_TOPIC" "Subscription" 5 1; then
+      echo "[WARN] No active subscriber on $GOAL_TOPIC before attempt $attempt" | tee -a "$VERIFY_LOG"
+      attempt=$((attempt + 1))
+      sleep 1
+      continue
+    fi
+
+    # Start listener first to avoid missing a fast one-shot /plan publish.
+    plan_tmp="$(mktemp)"
+    timeout 12s ros2 topic echo --once "$PLAN_TOPIC" >"$plan_tmp" 2>&1 &
+    PLAN_ECHO_PID=$!
+    sleep 0.4
+
     if ! publish_goal_once 2>&1 | tee -a "$VERIFY_LOG"; then
       verify_failed=1
     fi
 
-    plan_out="$(timeout 12s ros2 topic echo --once "$PLAN_TOPIC" 2>&1 || true)"
+    wait "$PLAN_ECHO_PID" || true
+    plan_out="$(cat "$plan_tmp")"
+    rm -f "$plan_tmp"
     echo "$plan_out" | tee -a "$VERIFY_LOG"
 
     if echo "$plan_out" | grep -Eq "poses:|frame_id|nav_msgs/msg/Path"; then
