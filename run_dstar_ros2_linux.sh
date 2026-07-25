@@ -23,6 +23,7 @@ SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 NODE_SRC="$SCRIPT_DIR/ros2_dstar_node.py"
 VERIFY_LOG="/tmp/dstar_e2e_verify.log"
+PLANNER_LOG="/tmp/dstar_planner_node.log"
 
 MAP_TOPIC="/map"
 ODOM_TOPIC="/odom"
@@ -44,6 +45,7 @@ HEALTH_RETRIES="10"
 HEALTH_INTERVAL="2"
 HZ_SECONDS="5"
 GOAL_RETRIES="4"
+CLEAN_STALE="1"
 
 usage() {
   cat <<EOF
@@ -77,8 +79,10 @@ Options:
   --health-retries INT        Health check retries in oneclick (default: 10)
   --health-interval INT       Seconds between health retries (default: 2)
   --verify-log PATH           Verification report path (default: /tmp/dstar_e2e_verify.log)
+  --planner-log PATH          Planner node log path (default: /tmp/dstar_planner_node.log)
   --hz-seconds INT            Duration for topic rate sampling (default: 5)
   --goal-retries INT          Goal publish retries during verify (default: 4)
+  --clean-stale 0|1           Kill stale runs before verify/oneclick (default: 1)
   -h, --help                  Show this help
 
 Examples:
@@ -91,8 +95,18 @@ Examples:
   $0 --action oneclick --mode package --bringup-cmd "ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py"
   $0 --action verify --mode package --bringup-cmd "ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py" --extra-bringup-cmd "ros2 launch turtlebot3_cartographer cartographer.launch.py use_sim_time:=True"
   $0 --action verify --mode package --goal-x 2.0 --goal-y 1.0
+
+Important:
+  If you split command across lines, every continued line must end with \\
+  and all options must belong to the same single shell command.
 EOF
 }
+
+if [[ $# -eq 0 ]]; then
+  echo "ERROR: No options were provided."
+  usage
+  exit 1
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -116,8 +130,10 @@ while [[ $# -gt 0 ]]; do
     --health-retries) HEALTH_RETRIES="$2"; shift 2 ;;
     --health-interval) HEALTH_INTERVAL="$2"; shift 2 ;;
     --verify-log) VERIFY_LOG="$2"; shift 2 ;;
+    --planner-log) PLANNER_LOG="$2"; shift 2 ;;
     --hz-seconds) HZ_SECONDS="$2"; shift 2 ;;
     --goal-retries) GOAL_RETRIES="$2"; shift 2 ;;
+    --clean-stale) CLEAN_STALE="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *)
       echo "Unknown argument: $1"
@@ -364,6 +380,21 @@ run_optional_bringup() {
   fi
 }
 
+cleanup_stale_processes() {
+  if [[ "$CLEAN_STALE" != "1" ]]; then
+    return 0
+  fi
+
+  echo "[INFO] Cleaning stale simulator/planner processes from earlier runs"
+  pkill -f "turtlebot3_world.launch.py" >/dev/null 2>&1 || true
+  pkill -f "cartographer.launch.py" >/dev/null 2>&1 || true
+  pkill -f "ros2 run dstar_planner ros2_dstar_node" >/dev/null 2>&1 || true
+  pkill -f "python3 .*ros2_dstar_node.py" >/dev/null 2>&1 || true
+
+  # Small pause for ROS graph to converge after process cleanup.
+  sleep 1
+}
+
 bringup_process_alive_or_report() {
   local pid="$1"
   local label="$2"
@@ -460,8 +491,12 @@ run_verify_flow() {
   local plan_tmp
 
   : >"$VERIFY_LOG"
+  : >"$PLANNER_LOG"
   echo "[INFO] Verification report: $VERIFY_LOG" | tee -a "$VERIFY_LOG"
+  echo "[INFO] Planner log: $PLANNER_LOG" | tee -a "$VERIFY_LOG"
   echo "[INFO] Starting full end-to-end verification" | tee -a "$VERIFY_LOG"
+
+  cleanup_stale_processes
 
   launch_ui_dashboards
   run_optional_bringup
@@ -507,7 +542,7 @@ run_verify_flow() {
   fi
   sample_topic_rate "$SCAN_TOPIC" "scan" "optional" || true
 
-  run_node_cmd &
+  run_node_cmd >"$PLANNER_LOG" 2>&1 &
   NODE_PID=$!
   sleep "$WAIT_SECONDS"
 
@@ -563,6 +598,8 @@ run_verify_flow() {
 
   if [[ "$plan_ok" -ne 1 ]]; then
     echo "[FAIL] Plan output not detected after retries" | tee -a "$VERIFY_LOG"
+    echo "[INFO] Last planner log lines:" | tee -a "$VERIFY_LOG"
+    tail -n 60 "$PLANNER_LOG" | tee -a "$VERIFY_LOG" || true
     verify_failed=1
   fi
 
@@ -642,6 +679,8 @@ case "$ACTION" in
     ;;
   oneclick)
     echo "[INFO] Action=oneclick: running full automated flow"
+
+    cleanup_stale_processes
 
     launch_ui_dashboards
 
