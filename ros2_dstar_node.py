@@ -35,6 +35,12 @@ import numpy as np
 try:
     import rclpy
     from rclpy.node import Node
+    from rclpy.qos import (
+        QoSDurabilityPolicy,
+        QoSHistoryPolicy,
+        QoSProfile,
+        QoSReliabilityPolicy,
+    )
     from nav_msgs.msg import OccupancyGrid, Odometry, Path
     from geometry_msgs.msg import PoseStamped
     ROS_AVAILABLE = True
@@ -147,6 +153,8 @@ if ROS_AVAILABLE:
             self.height = 0
             self.start_rc: Tuple[int, int] | None = None
             self.goal_rc: Tuple[int, int] | None = None
+            self.last_odom_xy: Tuple[float, float] | None = None
+            self.last_goal_xy: Tuple[float, float] | None = None
 
             # Parameters allow easier adaptation in VLab if topic names differ.
             self.declare_parameter("map_topic", "/map")
@@ -164,7 +172,13 @@ if ROS_AVAILABLE:
             self.occupied_threshold = int(self.get_parameter("occupied_threshold").value)
             self.max_iterations = int(self.get_parameter("max_iterations").value)
 
-            self.create_subscription(OccupancyGrid, map_topic, self.on_map, 10)
+            map_qos = QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            )
+            self.create_subscription(OccupancyGrid, map_topic, self.on_map, map_qos)
             self.create_subscription(PoseStamped, goal_topic, self.on_goal, 10)
             self.create_subscription(Odometry, odom_topic, self.on_odom, 10)
             self.plan_pub = self.create_publisher(Path, plan_topic, 10)
@@ -242,22 +256,34 @@ if ROS_AVAILABLE:
             self.origin = (msg.info.origin.position.x, msg.info.origin.position.y)
             data = np.array(msg.data, dtype=np.int8).reshape((h, w))
             self.grid = (data > self.occupied_threshold).astype(np.uint8)
+
+            # Convert cached world-space start/goal once map metadata is available.
+            if self.last_odom_xy is not None:
+                sx, sy = self.last_odom_xy
+                self.start_rc = self.world_to_rc(sx, sy)
+            if self.last_goal_xy is not None:
+                gx, gy = self.last_goal_xy
+                self.goal_rc = self.world_to_rc(gx, gy)
+
             self.try_plan()
 
         def on_odom(self, msg: Odometry) -> None:
             # ROS wrapper step: update current start cell from robot odometry.
+            p = msg.pose.pose.position
+            self.last_odom_xy = (p.x, p.y)
             if self.grid is None:
                 return
-            p = msg.pose.pose.position
             self.start_rc = self.world_to_rc(p.x, p.y)
             # Keep plan current if robot moves after the first goal.
             self.try_plan()
 
         def on_goal(self, msg: PoseStamped) -> None:
             # ROS wrapper step: update goal cell from operator/mission goal topic.
+            gx, gy = msg.pose.position.x, msg.pose.position.y
+            self.last_goal_xy = (gx, gy)
             if self.grid is None:
                 return
-            self.goal_rc = self.world_to_rc(msg.pose.position.x, msg.pose.position.y)
+            self.goal_rc = self.world_to_rc(gx, gy)
             self.try_plan()
 
         def try_plan(self) -> None:
